@@ -310,6 +310,16 @@ ID    STATUS        FILE                                PROGRESS
 
 ---
 
+# 📈 Persistent Statistics
+
+View accumulated download-manager statistics:
+
+```bash
+python -m app.main --stats
+```
+
+Statistics include total jobs, completed/failed/cancelled jobs, downloaded/uploaded bytes, average download speed, retry count, and recorded download/upload time.
+
 # ♻️ Resume Jobs
 
 Recover pending jobs:
@@ -352,29 +362,32 @@ python -m app.main --cleanup
 
 # ⚙️ Configuration
 
-| Variable               |        Default | Description              |
-| ---------------------- | -------------: | ------------------------ |
-| `TELEGRAM_BOT_TOKEN`   |              — | Telegram bot token       |
-| `TELEGRAM_CHAT_ID`     |              — | Telegram destination     |
-| `DOWNLOAD_DIR`         |    `downloads` | Download directory       |
-| `DB_PATH`              |      `jobs.db` | SQLite database          |
-| `LOG_FILE`             | `logs/app.log` | Application log          |
-| `MAX_DOWNLOAD_WORKERS` |            `3` | Concurrent downloads     |
-| `PART_WORKERS`         |            `4` | Concurrent parts/file    |
-| `UPLOAD_WORKERS`       |            `2` | Upload concurrency       |
-| `PART_SIZE`            |        `8 MiB` | Multipart size           |
-| `CHUNK_SIZE`           |        `1 MiB` | IO chunk size            |
-| `MAX_RETRIES`          |            `5` | Retry count              |
-| `REQUEST_TIMEOUT`      |         `3600` | Download timeout         |
-| `UPLOAD_TIMEOUT`       |         `3600` | Upload timeout           |
-| `RESUME_DOWNLOADS`     |         `true` | Resume partial files     |
-| `VERIFY_CHECKSUM`      |         `true` | Calculate SHA-256        |
-| `DELETE_AFTER_UPLOAD`  |         `true` | Delete local files       |
-| `ALLOW_PRIVATE_HOSTS`  |        `false` | Allow private IP targets |
-| `MAX_FILE_SIZE`        |            `0` | Maximum file size        |
-| `LOG_LEVEL`            |         `INFO` | Logging level            |
+| Variable | Default | Description |
+|---|---:|---|
+| `TELEGRAM_BOT_TOKEN` | — | Telegram bot token |
+| `TELEGRAM_CHAT_ID` | — | Telegram destination chat/channel/group ID |
+| `DOWNLOAD_DIR` | `downloads` | Local download directory |
+| `DB_PATH` | `jobs.db` | SQLite database path |
+| `LOG_FILE` | `logs/app.log` | Log file path |
+| `MAX_DOWNLOAD_WORKERS` | `3` | Maximum concurrent URL jobs |
+| `PART_WORKERS` | `4` | Concurrent multipart workers per file |
+| `UPLOAD_WORKERS` | `2` | Maximum concurrent Telegram uploads |
+| `PART_SIZE` | `8 MiB` | Multipart range size |
+| `CHUNK_SIZE` | `1 MiB` | Streaming I/O chunk size |
+| `MAX_RETRIES` | `5` | Maximum retry attempts |
+| `REQUEST_TIMEOUT` | `3600` | HTTP request timeout in seconds |
+| `UPLOAD_TIMEOUT` | `3600` | Telegram upload timeout in seconds |
+| `RESUME_DOWNLOADS` | `true` | Resume existing partial files |
+| `VERIFY_CHECKSUM` | `true` | Calculate SHA-256 after download |
+| `DELETE_AFTER_UPLOAD` | `true` | Delete completed local files after Telegram upload |
+| `CLEANUP_FAILED_PARTS` | `false` | Remove partial/assembling files after failed jobs |
+| `RECOVER_STALE_JOBS` | `true` | Recover stale jobs when the database starts |
+| `ALLOW_PRIVATE_HOSTS` | `false` | Permit private/local IP targets |
+| `MIN_FREE_DISK_SPACE` | `512 MiB` | Minimum free disk space to preserve |
+| `MAX_FILE_SIZE` | `0` | Maximum remote file size; `0` means unlimited |
+| `LOG_LEVEL` | `INFO` | Application logging level |
 
----
+Boolean variables accept `1/true/yes/on/y` and `0/false/no/off/n`. Numeric settings are validated when the application starts.
 
 # 🗄️ Database
 
@@ -405,6 +418,24 @@ jobs
 ```
 
 ---
+
+## 📊 Statistics Store
+
+In addition to the `jobs` table, the application maintains a persistent `statistics` record containing aggregate counters such as:
+
+```text
+total_jobs
+completed_jobs
+failed_jobs
+cancelled_jobs
+total_bytes_downloaded
+total_bytes_uploaded
+total_download_time
+total_upload_time
+retry_count
+```
+
+The statistics are updated during job creation, retries, cancellation, completion, and upload/download processing.
 
 # 🔄 Job Lifecycle
 
@@ -713,6 +744,10 @@ See `LICENSE`.
 
 # 🚧 Roadmap
 
+The core asynchronous downloader, multipart ranges, resumability, persistent job management, retry handling, Telegram uploads, checksum verification, disk protection, private-host protection, persistent statistics, and CLI lifecycle controls are implemented.
+
+Future enhancements:
+
 * [ ] Web dashboard
 * [ ] REST API
 * [ ] WebSocket live progress
@@ -731,8 +766,6 @@ See `LICENSE`.
 * [ ] Automated tests
 * [ ] CI/CD
 * [ ] Plugin system
-
----
 
 # 👨‍💻 Author
 
