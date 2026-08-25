@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
-import os
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -13,9 +13,11 @@ from app.utils import (
     filename_from_content_disposition,
     filename_from_url,
     host_resolves_to_private_ip,
+    is_permanent_http_status,
+    is_retryable_http_status,
     sanitize_filename,
     sha256_file,
-    sleep_backoff,
+    smart_sleep,
     validate_url,
 )
 
@@ -38,13 +40,14 @@ class MultiPartDownloader:
         allow_private_hosts=False,
         min_free_disk_space=0,
         max_file_size=0,
+        retry_callback=None,
     ):
-        self.directory = Path(directory)
-
-        self.directory.mkdir(
-            parents=True,
-            exist_ok=True,
+        self.logger = logging.getLogger(
+            "download_manager.downloader"
         )
+
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
 
         self.part_size = part_size
         self.part_workers = part_workers
@@ -62,6 +65,7 @@ class MultiPartDownloader:
         self.allow_private_hosts = allow_private_hosts
         self.min_free_disk_space = min_free_disk_space
         self.max_file_size = max_file_size
+        self.retry_callback = retry_callback
 
         self.session: aiohttp.ClientSession | None = None
 
@@ -79,13 +83,19 @@ class MultiPartDownloader:
         self.session = aiohttp.ClientSession(
             timeout=self.timeout,
             connector=connector,
-            headers={"User-Agent": ("AsyncDownloadManager/2.0 " "(aiohttp)")},
+            headers={
+                "User-Agent": "AsyncDownloadManager/2.0 (aiohttp)"
+            },
         )
 
     async def close(self):
         if self.session:
             await self.session.close()
             self.session = None
+
+    async def _notify_retry(self):
+        if self.retry_callback is not None:
+            await self.retry_callback()
 
     async def _validate_target(self, url: str):
         validate_url(url)
@@ -94,13 +104,12 @@ class MultiPartDownloader:
             return
 
         hostname = urlparse(url).hostname
-
         if not hostname:
             raise DownloadError("URL hostname is missing.")
 
         if await host_resolves_to_private_ip(hostname):
             raise DownloadError(
-                f"Refusing to download from private/local host: " f"{hostname}"
+                f"Refusing to download from private/local host: {hostname}"
             )
 
     @staticmethod
@@ -122,12 +131,9 @@ class MultiPartDownloader:
             ) as response:
                 if response.status < 400:
                     total = response.headers.get("Content-Length")
-
                     ranges = response.headers.get(
-                        "Accept-Ranges",
-                        "",
+                        "Accept-Ranges", ""
                     ).lower()
-
                     filename = filename_from_content_disposition(
                         response.headers.get("Content-Disposition")
                     )
@@ -137,11 +143,7 @@ class MultiPartDownloader:
                         ranges == "bytes",
                         filename,
                     )
-
-        except (
-            aiohttp.ClientError,
-            asyncio.TimeoutError,
-        ):
+        except (aiohttp.ClientError, asyncio.TimeoutError):
             pass
 
         try:
@@ -150,24 +152,30 @@ class MultiPartDownloader:
                 headers={"Range": "bytes=0-0"},
                 allow_redirects=True,
             ) as response:
+                if response.status >= 400:
+                    if is_permanent_http_status(response.status):
+                        raise DownloadError(
+                            f"HTTP {response.status}"
+                        )
+                    raise DownloadError(
+                        f"Unable to probe URL: HTTP {response.status}"
+                    )
+
                 if response.status not in (200, 206):
-                    raise DownloadError(f"HTTP {response.status}")
+                    raise DownloadError(
+                        f"Unexpected HTTP {response.status}"
+                    )
 
                 filename = filename_from_content_disposition(
                     response.headers.get("Content-Disposition")
                 )
 
                 content_range = response.headers.get(
-                    "Content-Range",
-                    "",
+                    "Content-Range", ""
                 )
 
                 if response.status == 206 and "/" in content_range:
-                    total_raw = content_range.rsplit(
-                        "/",
-                        1,
-                    )[1]
-
+                    total_raw = content_range.rsplit("/", 1)[1]
                     if total_raw != "*":
                         return (
                             int(total_raw),
@@ -175,19 +183,24 @@ class MultiPartDownloader:
                             filename,
                         )
 
-                content_length = response.headers.get("Content-Length")
+                content_length = response.headers.get(
+                    "Content-Length"
+                )
 
                 return (
-                    int(content_length) if content_length else None,
+                    int(content_length)
+                    if content_length
+                    else None,
                     False,
                     filename,
                 )
 
-        except (
-            aiohttp.ClientError,
-            asyncio.TimeoutError,
-        ) as exc:
-            raise DownloadError(f"Unable to probe URL: {exc}") from exc
+        except DownloadError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise DownloadError(
+                f"Unable to probe URL: {exc}"
+            ) from exc
 
     async def fetch_part(
         self,
@@ -198,10 +211,11 @@ class MultiPartDownloader:
         callback,
     ):
         if self.session is None:
-            raise RuntimeError("Downloader session is not started.")
+            raise RuntimeError(
+                "Downloader session is not started."
+            )
 
         expected = end - start + 1
-
         existing = path.stat().st_size if path.exists() else 0
 
         if not self.resume:
@@ -215,35 +229,58 @@ class MultiPartDownloader:
         if existing == expected:
             return existing
 
-        for attempt in range(
-            1,
-            self.retries + 1,
-        ):
+        last_error = None
+
+        for attempt in range(1, self.retries + 1):
             position = start + existing
+            retry_after = None
 
             try:
-                headers = {"Range": f"bytes={position}-{end}"}
+                headers = {
+                    "Range": f"bytes={position}-{end}"
+                }
 
                 async with self.session.get(
                     url,
                     headers=headers,
                     allow_redirects=True,
                 ) as response:
+                    retry_after = response.headers.get(
+                        "Retry-After"
+                    )
+
+                    if response.status >= 400:
+                        if is_retryable_http_status(
+                            response.status
+                        ):
+                            raise DownloadError(
+                                f"Retryable HTTP {response.status}"
+                            )
+
+                        if is_permanent_http_status(
+                            response.status
+                        ):
+                            raise DownloadError(
+                                f"Permanent HTTP {response.status}"
+                            )
+
+                        raise DownloadError(
+                            f"HTTP {response.status}"
+                        )
 
                     if response.status == 200:
                         if position != start:
                             raise DownloadError(
-                                "Server ignored Range request "
-                                "during resumed part download."
+                                "Server ignored Range request during "
+                                "resumed part download."
                             )
 
                         existing = 0
-
                         path.unlink(missing_ok=True)
 
                     elif response.status != 206:
                         raise DownloadError(
-                            f"Range request returned " f"HTTP {response.status}"
+                            f"Unexpected HTTP {response.status}"
                         )
 
                     mode = "ab" if existing else "wb"
@@ -253,30 +290,62 @@ class MultiPartDownloader:
                             self.chunk_size
                         ):
                             file.write(chunk)
-
                             existing += len(chunk)
-
                             await callback(len(chunk))
 
                 if existing != expected:
                     raise DownloadError(
-                        f"Part incomplete: " f"{existing}/{expected} bytes"
+                        f"Part incomplete: {existing}/{expected} bytes"
                     )
 
                 return existing
 
-            except (
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-                OSError,
-                DownloadError,
-            ) as exc:
+            except DownloadError as exc:
+                last_error = exc
+
+                if "Permanent HTTP" in str(exc):
+                    raise
+
                 if attempt >= self.retries:
                     raise
 
-                await sleep_backoff(attempt)
+            except (
+                aiohttp.ClientConnectionError,
+                aiohttp.ServerTimeoutError,
+                asyncio.TimeoutError,
+            ) as exc:
+                last_error = exc
 
-                existing = path.stat().st_size if path.exists() else 0
+                if attempt >= self.retries:
+                    raise DownloadError(
+                        "Network failure after "
+                        f"{attempt} attempts: {exc}"
+                    ) from exc
+
+            except OSError as exc:
+                raise DownloadError(
+                    f"Filesystem error: {exc}"
+                ) from exc
+
+            await self._notify_retry()
+
+            delay = await smart_sleep(
+                attempt,
+                retry_after=retry_after,
+            )
+
+            self.logger.warning(
+                "Part %s-%s failed on attempt %d/%d: %s. "
+                "Retrying in %.2fs",
+                start,
+                end,
+                attempt,
+                self.retries,
+                last_error,
+                delay,
+            )
+
+            existing = path.stat().st_size if path.exists() else 0
 
         raise DownloadError("Multipart part failed.")
 
@@ -288,18 +357,30 @@ class MultiPartDownloader:
     ):
         total, supports_range, detected_name = await self.probe(url)
 
-        if detected_name:
-            filename = detected_name
-        else:
-            filename = sanitize_filename(filename)
+        filename = (
+            sanitize_filename(detected_name)
+            if detected_name
+            else sanitize_filename(filename)
+        )
 
         final = self.directory / filename
 
-        if total and total > 0 and final.exists() and final.stat().st_size == total:
+        if (
+            total
+            and total > 0
+            and final.exists()
+            and final.stat().st_size == total
+        ):
             return final, total
 
-        if self.max_file_size and total and total > self.max_file_size:
-            raise DownloadError("Remote file exceeds MAX_FILE_SIZE.")
+        if (
+            self.max_file_size
+            and total
+            and total > self.max_file_size
+        ):
+            raise DownloadError(
+                "Remote file exceeds MAX_FILE_SIZE."
+            )
 
         check_disk_space(
             self.directory,
@@ -316,14 +397,17 @@ class MultiPartDownloader:
             )
 
         count = math.ceil(total / self.part_size)
+        parts = [
+            self.directory / f"{filename}.part{i:05d}"
+            for i in range(count)
+        ]
 
-        parts = [self.directory / f"{filename}.part{i:05d}" for i in range(count)]
-
-        semaphore = asyncio.Semaphore(self.part_workers)
+        semaphore = asyncio.Semaphore(
+            self.part_workers
+        )
 
         async def download_one(index: int):
             start = index * self.part_size
-
             end = min(
                 total - 1,
                 start + self.part_size - 1,
@@ -338,29 +422,37 @@ class MultiPartDownloader:
                     callback,
                 )
 
-        try:
-            await asyncio.gather(*(download_one(i) for i in range(count)))
+        temp_final = Path(
+            f"{final}.assembling"
+        )
 
-            temp_final = Path(f"{final}.assembling")
+        try:
+            await asyncio.gather(
+                *(download_one(i) for i in range(count))
+            )
 
             temp_final.unlink(missing_ok=True)
 
             with temp_final.open("wb") as output:
                 for part in parts:
                     if not part.exists():
-                        raise DownloadError(f"Missing part: {part.name}")
+                        raise DownloadError(
+                            f"Missing part: {part.name}"
+                        )
 
                     with part.open("rb") as source:
                         while True:
-                            chunk = source.read(self.chunk_size)
-
+                            chunk = source.read(
+                                self.chunk_size
+                            )
                             if not chunk:
                                 break
-
                             output.write(chunk)
 
             if temp_final.stat().st_size != total:
-                raise DownloadError("Final assembled file has " "an unexpected size.")
+                raise DownloadError(
+                    "Final assembled file has an unexpected size."
+                )
 
             temp_final.replace(final)
 
@@ -370,8 +462,6 @@ class MultiPartDownloader:
             return final, total
 
         except Exception:
-            temp_final = Path(f"{final}.assembling")
-
             temp_final.unlink(missing_ok=True)
 
             if not self.resume:
@@ -388,43 +478,72 @@ class MultiPartDownloader:
         callback,
     ):
         if self.session is None:
-            raise RuntimeError("Downloader session is not started.")
+            raise RuntimeError(
+                "Downloader session is not started."
+            )
 
         final = self.directory / filename
-
         partial = Path(f"{final}.part")
 
-        existing = partial.stat().st_size if partial.exists() else 0
+        existing = (
+            partial.stat().st_size
+            if partial.exists()
+            else 0
+        )
 
         if not self.resume:
             existing = 0
             partial.unlink(missing_ok=True)
 
-        for attempt in range(
-            1,
-            self.retries + 1,
-        ):
+        last_error = None
+
+        for attempt in range(1, self.retries + 1):
+            retry_after = None
+
             try:
                 headers = {}
 
                 if existing:
-                    headers["Range"] = f"bytes={existing}-"
+                    headers["Range"] = (
+                        f"bytes={existing}-"
+                    )
 
                 async with self.session.get(
                     url,
                     headers=headers,
                     allow_redirects=True,
                 ) as response:
+                    retry_after = response.headers.get(
+                        "Retry-After"
+                    )
 
-                    if response.status not in (
-                        200,
-                        206,
-                    ):
-                        raise DownloadError(f"HTTP {response.status}")
+                    if response.status >= 400:
+                        if is_retryable_http_status(
+                            response.status
+                        ):
+                            raise DownloadError(
+                                f"Retryable HTTP {response.status}"
+                            )
+
+                        if is_permanent_http_status(
+                            response.status
+                        ):
+                            raise DownloadError(
+                                f"Permanent HTTP {response.status}"
+                            )
+
+                        raise DownloadError(
+                            f"HTTP {response.status}"
+                        )
 
                     if existing and response.status == 200:
                         existing = 0
                         partial.unlink(missing_ok=True)
+
+                    elif response.status not in (200, 206):
+                        raise DownloadError(
+                            f"Unexpected HTTP {response.status}"
+                        )
 
                     mode = "ab" if existing else "wb"
 
@@ -433,37 +552,73 @@ class MultiPartDownloader:
                             self.chunk_size
                         ):
                             file.write(chunk)
-
                             existing += len(chunk)
-
                             await callback(len(chunk))
 
                 if total and existing != total:
-                    raise DownloadError(f"Download incomplete: " f"{existing}/{total}")
+                    raise DownloadError(
+                        f"Download incomplete: "
+                        f"{existing}/{total}"
+                    )
 
                 partial.replace(final)
 
                 return final, total or existing
 
-            except (
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-                OSError,
-                DownloadError,
-            ):
+            except DownloadError as exc:
+                last_error = exc
+
+                if "Permanent HTTP" in str(exc):
+                    raise
+
                 if attempt >= self.retries:
                     raise
 
-                await sleep_backoff(attempt)
+            except (
+                aiohttp.ClientConnectionError,
+                aiohttp.ServerTimeoutError,
+                asyncio.TimeoutError,
+            ) as exc:
+                last_error = exc
 
-                existing = partial.stat().st_size if partial.exists() else 0
+                if attempt >= self.retries:
+                    raise DownloadError(
+                        "Network failure after "
+                        f"{attempt} attempts: {exc}"
+                    ) from exc
 
-        raise DownloadError("Single-stream download failed.")
+            except OSError as exc:
+                raise DownloadError(
+                    f"Filesystem error: {exc}"
+                ) from exc
 
-    async def checksum(
-        self,
-        path: Path,
-    ) -> str:
+            await self._notify_retry()
+
+            delay = await smart_sleep(
+                attempt,
+                retry_after=retry_after,
+            )
+
+            self.logger.warning(
+                "Download failed on attempt %d/%d: %s. "
+                "Retrying in %.2fs",
+                attempt,
+                self.retries,
+                last_error,
+                delay,
+            )
+
+            existing = (
+                partial.stat().st_size
+                if partial.exists()
+                else 0
+            )
+
+        raise DownloadError(
+            "Single-stream download failed."
+        )
+
+    async def checksum(self, path: Path) -> str:
         return await sha256_file(
             path,
             self.chunk_size,
