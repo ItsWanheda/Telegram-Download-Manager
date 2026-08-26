@@ -769,7 +769,7 @@ Future enhancements:
 
 # 👨‍💻 Author
 
-**Jax Nomad**
+**ItsWanheda**
 
 Built with Python, asyncio, aiohttp, SQLite, and the Telegram Bot API.
 
